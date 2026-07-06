@@ -92,6 +92,7 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -125,6 +126,47 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.documents.write().unwrap().remove(&params.text_document.uri);
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let text = match self.documents.read().unwrap().get(&uri) {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        let lines: Vec<&str> = text.lines().collect();
+
+        let Some(block) = actions::find_vault_block(&lines, position.line as usize) else {
+            return Ok(None);
+        };
+
+        let resolved = self.resolve_passwords(&uri);
+        let value = if resolved.passwords.is_empty() {
+            "**Ansible Vault**: no vault password found \
+             (checked initialization_options, ANSIBLE_VAULT_PASSWORD_FILE, ansible.cfg)"
+                .to_string()
+        } else {
+            match vault::decrypt_any(&block.vaulttext, &resolved.passwords) {
+                Ok(plaintext) => {
+                    // Use a longer fence if the plaintext itself contains one.
+                    let fence = if plaintext.contains("```") { "`````" } else { "```" };
+                    format!("**Ansible Vault** (decrypted)\n\n{fence}text\n{plaintext}\n{fence}")
+                }
+                Err(e) => format!("**Ansible Vault**: {e}"),
+            }
+        };
+
+        Ok(Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value,
+            }),
+            range: Some(Range::new(
+                Position::new(block.start_line as u32, 0),
+                Position::new(block.end_line as u32, u32::MAX),
+            )),
+        }))
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {

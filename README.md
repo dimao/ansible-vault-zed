@@ -22,6 +22,8 @@ Put the cursor on a value and open code actions (`cmd-.` / `ctrl-.`):
   `!vault |` inline block.
 - **Decrypt with Ansible Vault** — anywhere on a `!vault |` block (tag line or payload),
   replaces it with the plaintext value (quoted / block-scalar formatted as needed).
+- **Hover preview** — hover over any `!vault |` block to see the decrypted plaintext in a
+  tooltip without modifying the file.
 
 Works for mapping values and list items (`- !vault |`). Multiline plaintext round-trips via
 literal block scalars. Compatibility with the real `ansible-vault` CLI is covered by
@@ -104,7 +106,6 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ## Roadmap
 
-- Hover: preview decrypted value without editing the file
 - Whole-file encrypt/decrypt code actions
 - Diagnostics for undecryptable blocks
 - Publish to the Zed extensions registry
