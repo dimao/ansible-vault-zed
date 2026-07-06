@@ -78,7 +78,8 @@ Release binaries are built by CI (`.github/workflows/release.yml`) on every `v*`
       "initialization_options": {
         "passwordFile": "~/.vault-pass.txt",
         // "password": "inline-password",   // avoid committing this
-        // "encryptVaultId": "dev"          // emit $ANSIBLE_VAULT;1.2;AES256;dev headers
+        // "encryptVaultId": "dev",         // emit $ANSIBLE_VAULT;1.2;AES256;dev headers
+        // "hoverPreview": false            // disable decrypted-value hover tooltips
       },
       // Optional — explicit binary location:
       "binary": { "path": "/home/you/.cargo/bin/ansible-vault-lsp" }

@@ -22,6 +22,8 @@ pub struct InitOptions {
     pub password_file: Option<String>,
     /// Vault id label to use when encrypting (produces a 1.2 header).
     pub encrypt_vault_id: Option<String>,
+    /// Show decrypted values when hovering over vault blocks (default: true).
+    pub hover_preview: Option<bool>,
 }
 
 #[derive(Debug, Default)]

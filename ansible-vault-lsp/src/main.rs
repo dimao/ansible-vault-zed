@@ -84,6 +84,13 @@ impl LanguageServer for Backend {
             }
         }
 
+        let hover_enabled = self
+            .init_options
+            .read()
+            .unwrap()
+            .hover_preview
+            .unwrap_or(true);
+
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
                 name: "ansible-vault-lsp".into(),
@@ -92,7 +99,7 @@ impl LanguageServer for Backend {
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
                 code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
+                hover_provider: hover_enabled.then_some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
         })
@@ -129,6 +136,10 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        // Belt-and-braces: also honor the setting if a client ignores capabilities.
+        if !self.init_options.read().unwrap().hover_preview.unwrap_or(true) {
+            return Ok(None);
+        }
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         let text = match self.documents.read().unwrap().get(&uri) {
