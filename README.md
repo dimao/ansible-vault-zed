@@ -48,8 +48,8 @@ built-in implementation:
 
 - resolved password files are passed via `--vault-id`; `encryptVaultId` maps to
   `--encrypt-vault-id`
-- a literal `password` option is written to a `0600` temp file only for the duration of
-  the call, then deleted
+- nothing is ever written to disk: a literal `password` option is rejected in this mode
+  (ansible-vault only reads passwords from files — use `passwordFile`)
 - if no password was resolved, `ansible-vault` runs in the document's directory and does
   its own `ansible.cfg` / environment discovery
 - code actions are computed lazily (`codeAction/resolve`), so the subprocess only runs

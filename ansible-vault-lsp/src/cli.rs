@@ -2,9 +2,12 @@
 //! users who prefer not to trust the built-in crypto implementation.
 //!
 //! Password handling:
-//! - password *files* we resolved are passed via `--vault-id <path>`
-//! - a literal password (from initialization_options) is written to a 0600
-//!   temp file for the duration of the call and removed immediately after
+//! - password *files* we resolved (passwordFile, ANSIBLE_VAULT_PASSWORD_FILE,
+//!   ansible.cfg) are passed via `--vault-password-file <path>` — nothing is
+//!   ever written to disk by us
+//! - a literal `password` option is rejected in CLI mode: ansible-vault can
+//!   only read passwords from a file/script/prompt, and we refuse to write
+//!   secrets to temp files
 //! - if we resolved nothing, ansible-vault performs its own ansible.cfg /
 //!   environment discovery (we set the working directory to the document dir)
 
@@ -13,54 +16,37 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Temp password file that is deleted on drop.
-pub struct TempPasswordFile {
-    path: PathBuf,
-}
-
-impl TempPasswordFile {
-    fn create(password: &str) -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "ansible-vault-lsp-{}-{:x}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+fn password_files(resolved: &Resolved) -> Result<Vec<PathBuf>, String> {
+    if !resolved.literals.is_empty() {
+        return Err(
+            "a literal `password` cannot be used with `ansibleVaultPath`: ansible-vault \
+             only reads passwords from files, and writing it to a temp file would defeat \
+             the purpose of the CLI backend. Use `passwordFile` instead."
+                .into(),
+        );
+    }
+    // Dedup while preserving resolution order.
+    let mut files: Vec<PathBuf> = Vec::new();
+    for f in &resolved.files {
+        if !files.contains(f) {
+            files.push(f.clone());
         }
-        let mut f = opts.open(&path)?;
-        f.write_all(password.as_bytes())?;
-        f.write_all(b"\n")?;
-        Ok(Self { path })
+    }
+    Ok(files)
+}
+
+/// When we pass password files explicitly, drop the inherited env var so
+/// ansible-vault doesn't see the same password as a second vault identity.
+fn set_password_args(cmd: &mut Command, files: &[PathBuf]) {
+    if !files.is_empty() {
+        cmd.env_remove("ANSIBLE_VAULT_PASSWORD_FILE");
+    }
+    for f in files {
+        cmd.arg("--vault-password-file").arg(f);
     }
 }
 
-impl Drop for TempPasswordFile {
-    fn drop(&mut self) {
-        std::fs::remove_file(&self.path).ok();
-    }
-}
 
-/// Password files to pass on the command line (+ guards keeping temp files alive).
-fn materialize(resolved: &Resolved) -> Result<(Vec<PathBuf>, Vec<TempPasswordFile>), String> {
-    let mut files = Vec::new();
-    let mut guards = Vec::new();
-    for literal in &resolved.literals {
-        let tmp = TempPasswordFile::create(literal)
-            .map_err(|e| format!("failed to create temp password file: {e}"))?;
-        files.push(tmp.path.clone());
-        guards.push(tmp);
-    }
-    files.extend(resolved.files.iter().cloned());
-    Ok((files, guards))
-}
 
 fn run(mut cmd: Command, cwd: Option<&Path>, stdin_data: &str) -> Result<String, String> {
     if let Some(dir) = cwd.filter(|d| d.is_dir()) {
@@ -102,27 +88,24 @@ pub fn encrypt(
     cwd: Option<&Path>,
     resolved: &Resolved,
 ) -> Result<String, String> {
-    let (files, _guards) = materialize(resolved)?;
+    let files = password_files(resolved)?;
     let mut cmd = Command::new(program);
     cmd.args(["encrypt", "--output", "-"]);
 
+    // Encryption uses exactly one identity (the first resolved password file,
+    // same precedence as the native backend) to avoid --encrypt-vault-id
+    // ambiguity when several identities are known.
+    let encrypt_files: Vec<PathBuf> = files.into_iter().take(1).collect();
     match encrypt_vault_id {
         Some(id) if !id.is_empty() => {
-            // Label the first identity so --encrypt-vault-id can select it.
-            let mut iter = files.iter();
-            if let Some(first) = iter.next() {
+            if let Some(first) = encrypt_files.first() {
+                // Label the identity so --encrypt-vault-id can select it.
+                cmd.env_remove("ANSIBLE_VAULT_PASSWORD_FILE");
                 cmd.arg("--vault-id").arg(format!("{id}@{}", first.display()));
-            }
-            for f in iter {
-                cmd.arg("--vault-id").arg(f);
             }
             cmd.args(["--encrypt-vault-id", id]);
         }
-        _ => {
-            for f in &files {
-                cmd.arg("--vault-id").arg(f);
-            }
-        }
+        _ => set_password_args(&mut cmd, &encrypt_files),
     }
 
     let out = run(cmd, cwd, plaintext)?;
@@ -139,11 +122,9 @@ pub fn decrypt(
     cwd: Option<&Path>,
     resolved: &Resolved,
 ) -> Result<String, String> {
-    let (files, _guards) = materialize(resolved)?;
+    let files = password_files(resolved)?;
     let mut cmd = Command::new(program);
     cmd.args(["decrypt", "--output", "-"]);
-    for f in &files {
-        cmd.arg("--vault-id").arg(f);
-    }
+    set_password_args(&mut cmd, &files);
     run(cmd, cwd, vaulttext)
 }
