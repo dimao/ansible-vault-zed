@@ -1,19 +1,25 @@
 mod actions;
+mod cli;
 mod password;
 mod vault;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
 
+const TITLE_ENCRYPT: &str = "Encrypt with Ansible Vault";
+const TITLE_DECRYPT: &str = "Decrypt with Ansible Vault";
+
 struct Backend {
     client: Client,
     documents: RwLock<HashMap<Url, String>>,
     init_options: RwLock<password::InitOptions>,
+    supports_resolve: AtomicBool,
 }
 
 impl Backend {
@@ -26,47 +32,127 @@ impl Backend {
         password::resolve(&opts, Self::document_dir(uri).as_deref())
     }
 
-    fn full_line_edit(
-        &self,
-        uri: &Url,
-        start_line: usize,
-        end_line: usize,
-        new_text: String,
-        title: &str,
-        total_lines: usize,
-    ) -> CodeAction {
-        // Replace lines start..=end. If there is a following line, span up to its
-        // column 0 and keep a trailing newline; otherwise replace to end of file.
-        let (range, new_text) = if end_line + 1 < total_lines {
-            (
-                Range::new(
-                    Position::new(start_line as u32, 0),
-                    Position::new(end_line as u32 + 1, 0),
-                ),
-                format!("{new_text}\n"),
+    /// Path to the ansible-vault executable, if the CLI backend is enabled.
+    fn cli_program(&self) -> Option<String> {
+        self.init_options
+            .read()
+            .unwrap()
+            .ansible_vault_path
+            .clone()
+            .filter(|p| !p.is_empty())
+    }
+
+    fn do_decrypt(&self, uri: &Url, vaulttext: &str) -> std::result::Result<String, String> {
+        let resolved = self.resolve_passwords(uri);
+        if let Some(program) = self.cli_program() {
+            cli::decrypt(&program, vaulttext, Self::document_dir(uri).as_deref(), &resolved)
+        } else {
+            if resolved.passwords.is_empty() {
+                return Err(no_password_message());
+            }
+            vault::decrypt_any(vaulttext, &resolved.passwords).map_err(|e| e.to_string())
+        }
+    }
+
+    fn do_encrypt(&self, uri: &Url, plaintext: &str) -> std::result::Result<String, String> {
+        let resolved = self.resolve_passwords(uri);
+        let vault_id = self.init_options.read().unwrap().encrypt_vault_id.clone();
+        if let Some(program) = self.cli_program() {
+            cli::encrypt(
+                &program,
+                plaintext,
+                vault_id.as_deref(),
+                Self::document_dir(uri).as_deref(),
+                &resolved,
             )
         } else {
-            (
-                Range::new(
-                    Position::new(start_line as u32, 0),
-                    Position::new(end_line as u32, u32::MAX),
-                ),
-                new_text,
-            )
-        };
-
-        let mut changes = HashMap::new();
-        changes.insert(uri.clone(), vec![TextEdit { range, new_text }]);
-
-        CodeAction {
-            title: title.to_string(),
-            kind: Some(CodeActionKind::REFACTOR_REWRITE),
-            edit: Some(WorkspaceEdit {
-                changes: Some(changes),
-                ..Default::default()
-            }),
-            ..Default::default()
+            let Some(pw) = resolved.passwords.first() else {
+                return Err(no_password_message());
+            };
+            Ok(vault::encrypt(plaintext, pw, vault_id.as_deref()))
         }
+    }
+
+    /// Compute the (title, edit) for the action at `cursor`, running crypto.
+    fn compute_action(
+        &self,
+        uri: &Url,
+        cursor: usize,
+    ) -> std::result::Result<Option<(&'static str, WorkspaceEdit)>, String> {
+        let text = match self.documents.read().unwrap().get(uri) {
+            Some(t) => t.clone(),
+            None => return Ok(None),
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        let total = lines.len();
+
+        if let Some(block) = actions::find_vault_block(&lines, cursor) {
+            let plaintext = self.do_decrypt(uri, &block.vaulttext)?;
+            let new_text = actions::render_decrypted(&block, &plaintext);
+            let edit = full_line_edit(uri, block.start_line, block.end_line, new_text, total);
+            Ok(Some((TITLE_DECRYPT, edit)))
+        } else if let Some(plain) = actions::find_plain_value(&lines, cursor) {
+            let vaulttext = self.do_encrypt(uri, &plain.value)?;
+            let new_text = actions::render_encrypted(&plain, &vaulttext);
+            let edit = full_line_edit(uri, plain.line, plain.line, new_text, total);
+            Ok(Some((TITLE_ENCRYPT, edit)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Cheap detection (no crypto) of which action applies at `cursor`.
+    fn available_action(&self, uri: &Url, cursor: usize) -> Option<&'static str> {
+        let text = self.documents.read().unwrap().get(uri).cloned()?;
+        let lines: Vec<&str> = text.lines().collect();
+        if actions::find_vault_block(&lines, cursor).is_some() {
+            Some(TITLE_DECRYPT)
+        } else if actions::find_plain_value(&lines, cursor).is_some() {
+            Some(TITLE_ENCRYPT)
+        } else {
+            None
+        }
+    }
+}
+
+fn no_password_message() -> String {
+    "no vault password found (checked initialization_options, \
+     ANSIBLE_VAULT_PASSWORD_FILE, ansible.cfg)"
+        .to_string()
+}
+
+fn full_line_edit(
+    uri: &Url,
+    start_line: usize,
+    end_line: usize,
+    new_text: String,
+    total_lines: usize,
+) -> WorkspaceEdit {
+    // Replace lines start..=end. If there is a following line, span up to its
+    // column 0 and keep a trailing newline; otherwise replace to end of file.
+    let (range, new_text) = if end_line + 1 < total_lines {
+        (
+            Range::new(
+                Position::new(start_line as u32, 0),
+                Position::new(end_line as u32 + 1, 0),
+            ),
+            format!("{new_text}\n"),
+        )
+    } else {
+        (
+            Range::new(
+                Position::new(start_line as u32, 0),
+                Position::new(end_line as u32, u32::MAX),
+            ),
+            new_text,
+        )
+    };
+
+    let mut changes = HashMap::new();
+    changes.insert(uri.clone(), vec![TextEdit { range, new_text }]);
+    WorkspaceEdit {
+        changes: Some(changes),
+        ..Default::default()
     }
 }
 
@@ -84,6 +170,16 @@ impl LanguageServer for Backend {
             }
         }
 
+        let client_resolves = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|t| t.code_action.as_ref())
+            .and_then(|c| c.resolve_support.as_ref())
+            .map(|r| r.properties.iter().any(|p| p == "edit"))
+            .unwrap_or(false);
+        self.supports_resolve.store(client_resolves, Ordering::Relaxed);
+
         let hover_enabled = self
             .init_options
             .read()
@@ -98,7 +194,10 @@ impl LanguageServer for Backend {
             }),
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                })),
                 hover_provider: hover_enabled.then_some(HoverProviderCapability::Simple(true)),
                 ..Default::default()
             },
@@ -152,20 +251,13 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
 
-        let resolved = self.resolve_passwords(&uri);
-        let value = if resolved.passwords.is_empty() {
-            "**Ansible Vault**: no vault password found \
-             (checked initialization_options, ANSIBLE_VAULT_PASSWORD_FILE, ansible.cfg)"
-                .to_string()
-        } else {
-            match vault::decrypt_any(&block.vaulttext, &resolved.passwords) {
-                Ok(plaintext) => {
-                    // Use a longer fence if the plaintext itself contains one.
-                    let fence = if plaintext.contains("```") { "`````" } else { "```" };
-                    format!("**Ansible Vault** (decrypted)\n\n{fence}text\n{plaintext}\n{fence}")
-                }
-                Err(e) => format!("**Ansible Vault**: {e}"),
+        let value = match self.do_decrypt(&uri, &block.vaulttext) {
+            Ok(plaintext) => {
+                // Use a longer fence if the plaintext itself contains one.
+                let fence = if plaintext.contains("```") { "`````" } else { "```" };
+                format!("**Ansible Vault** (decrypted)\n\n{fence}text\n{plaintext}\n{fence}")
             }
+            Err(e) => format!("**Ansible Vault**: {e}"),
         };
 
         Ok(Some(Hover {
@@ -182,69 +274,63 @@ impl LanguageServer for Backend {
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
-        let text = match self.documents.read().unwrap().get(&uri) {
-            Some(t) => t.clone(),
-            None => return Ok(None),
-        };
-        let lines: Vec<&str> = text.lines().collect();
-        let total = lines.len();
         let cursor = params.range.start.line as usize;
 
-        let mut response: Vec<CodeActionOrCommand> = Vec::new();
+        if self.supports_resolve.load(Ordering::Relaxed) {
+            // Lazy: only detect availability here; crypto runs in resolve.
+            let Some(title) = self.available_action(&uri, cursor) else {
+                return Ok(None);
+            };
+            let action = CodeAction {
+                title: title.to_string(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                data: Some(serde_json::json!({ "uri": uri, "line": cursor })),
+                ..Default::default()
+            };
+            return Ok(Some(vec![CodeActionOrCommand::CodeAction(action)]));
+        }
 
-        if let Some(block) = actions::find_vault_block(&lines, cursor) {
-            let resolved = self.resolve_passwords(&uri);
-            if resolved.passwords.is_empty() {
+        // Eager fallback for clients without codeAction/resolve support.
+        match self.compute_action(&uri, cursor) {
+            Ok(Some((title, edit))) => Ok(Some(vec![CodeActionOrCommand::CodeAction(CodeAction {
+                title: title.to_string(),
+                kind: Some(CodeActionKind::REFACTOR_REWRITE),
+                edit: Some(edit),
+                ..Default::default()
+            })])),
+            Ok(None) => Ok(None),
+            Err(e) => {
                 self.client
-                    .show_message(
-                        MessageType::WARNING,
-                        "ansible-vault-lsp: no vault password found (checked initialization_options, \
-                         ANSIBLE_VAULT_PASSWORD_FILE, ansible.cfg)",
-                    )
+                    .show_message(MessageType::ERROR, format!("ansible-vault-lsp: {e}"))
                     .await;
-            } else {
-                match vault::decrypt_any(&block.vaulttext, &resolved.passwords) {
-                    Ok(plaintext) => {
-                        let new_text = actions::render_decrypted(&block, &plaintext);
-                        response.push(CodeActionOrCommand::CodeAction(self.full_line_edit(
-                            &uri,
-                            block.start_line,
-                            block.end_line,
-                            new_text,
-                            "Decrypt with Ansible Vault",
-                            total,
-                        )));
-                    }
-                    Err(e) => {
-                        self.client
-                            .show_message(MessageType::ERROR, format!("ansible-vault-lsp: {e}"))
-                            .await;
-                    }
-                }
-            }
-        } else if let Some(plain) = actions::find_plain_value(&lines, cursor) {
-            let resolved = self.resolve_passwords(&uri);
-            if let Some(pw) = resolved.passwords.first() {
-                let opts = self.init_options.read().unwrap().clone();
-                let vaulttext = vault::encrypt(&plain.value, pw, opts.encrypt_vault_id.as_deref());
-                let new_text = actions::render_encrypted(&plain, &vaulttext);
-                let line = plain.line;
-                response.push(CodeActionOrCommand::CodeAction(self.full_line_edit(
-                    &uri,
-                    line,
-                    line,
-                    new_text,
-                    "Encrypt with Ansible Vault",
-                    total,
-                )));
+                Ok(None)
             }
         }
+    }
 
-        if response.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(response))
+    async fn code_action_resolve(&self, mut action: CodeAction) -> Result<CodeAction> {
+        let Some(data) = action.data.take() else {
+            return Ok(action);
+        };
+        let (Some(uri), Some(line)) = (
+            data.get("uri")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Url::parse(s).ok()),
+            data.get("line").and_then(|v| v.as_u64()),
+        ) else {
+            return Ok(action);
+        };
+
+        match self.compute_action(&uri, line as usize) {
+            Ok(Some((_title, edit))) => action.edit = Some(edit),
+            Ok(None) => {}
+            Err(e) => {
+                self.client
+                    .show_message(MessageType::ERROR, format!("ansible-vault-lsp: {e}"))
+                    .await;
+            }
         }
+        Ok(action)
     }
 }
 
@@ -257,6 +343,7 @@ async fn main() {
         client,
         documents: RwLock::new(HashMap::new()),
         init_options: RwLock::new(password::InitOptions::default()),
+        supports_resolve: AtomicBool::new(false),
     });
 
     Server::new(stdin, stdout, socket).serve(service).await;

@@ -24,6 +24,9 @@ pub struct InitOptions {
     pub encrypt_vault_id: Option<String>,
     /// Show decrypted values when hovering over vault blocks (default: true).
     pub hover_preview: Option<bool>,
+    /// Path to an `ansible-vault` executable. When set, encryption and
+    /// decryption shell out to it instead of using the built-in crypto.
+    pub ansible_vault_path: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -31,6 +34,11 @@ pub struct Resolved {
     /// Candidate passwords, tried in order for decryption. First one is used
     /// for encryption.
     pub passwords: Vec<String>,
+    /// Password file paths backing the resolved passwords (for the CLI backend).
+    pub files: Vec<PathBuf>,
+    /// Literal passwords with no backing file (for the CLI backend these are
+    /// written to short-lived temp files).
+    pub literals: Vec<String>,
     /// Human-readable description of where the password came from.
     pub sources: Vec<String>,
 }
@@ -40,19 +48,24 @@ pub fn resolve(opts: &InitOptions, document_dir: Option<&Path>) -> Resolved {
 
     if let Some(pw) = &opts.password {
         out.passwords.push(pw.clone());
+        out.literals.push(pw.clone());
         out.sources.push("initialization_options.password".into());
     }
     if let Some(file) = &opts.password_file {
-        if let Some(pw) = read_password_file(Path::new(&expand_tilde(file))) {
+        let path = PathBuf::from(expand_tilde(file));
+        if let Some(pw) = read_password_file(&path) {
             out.passwords.push(pw);
+            out.files.push(path);
             out.sources.push(format!("initialization_options.passwordFile ({file})"));
         }
     }
 
     if let Ok(file) = std::env::var("ANSIBLE_VAULT_PASSWORD_FILE") {
         if !file.is_empty() {
-            if let Some(pw) = read_password_file(Path::new(&expand_tilde(&file))) {
+            let path = PathBuf::from(expand_tilde(&file));
+            if let Some(pw) = read_password_file(&path) {
                 out.passwords.push(pw);
+                out.files.push(path);
                 out.sources.push(format!("ANSIBLE_VAULT_PASSWORD_FILE ({file})"));
             }
         }
@@ -64,6 +77,7 @@ pub fn resolve(opts: &InitOptions, document_dir: Option<&Path>) -> Resolved {
                 let path = resolve_relative(&expand_tilde(&f), &cfg_dir);
                 if let Some(pw) = read_password_file(&path) {
                     out.passwords.push(pw);
+                    out.files.push(path);
                     out.sources.push(format!("{} ({})", cfg.display(), f));
                 }
             }

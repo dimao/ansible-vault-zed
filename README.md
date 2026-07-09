@@ -11,7 +11,7 @@ actions** provided by a small native language server.
 
 | Directory            | What it is |
 |----------------------|------------|
-| `ansible-vault-lsp/` | Rust LSP server. Native implementation of the Ansible Vault 1.1/1.2 format (PBKDF2-SHA256 → AES-256-CTR + HMAC-SHA256). No `ansible` installation required. |
+| `ansible-vault-lsp/` | Rust LSP server. Native implementation of the Ansible Vault 1.1/1.2 format (PBKDF2-SHA256 → AES-256-CTR + HMAC-SHA256). No `ansible` installation required — or optionally shells out to your own `ansible-vault` (see `ansibleVaultPath`). |
 | `zed-ansible-vault/` | Zed extension (WASM) that launches the LSP for YAML / Ansible files. |
 
 ## Features
@@ -39,6 +39,21 @@ integration tests (both directions).
 
 Executable password files are run and their stdout is used (script sources). With multiple
 identities, **all** passwords are tried for decryption; the first one is used for encryption.
+
+## CLI backend (don't trust our crypto?)
+
+Set `initialization_options.ansibleVaultPath` to an `ansible-vault` executable and all
+encryption/decryption (including hover previews) shells out to it instead of using the
+built-in implementation:
+
+- resolved password files are passed via `--vault-id`; `encryptVaultId` maps to
+  `--encrypt-vault-id`
+- a literal `password` option is written to a `0600` temp file only for the duration of
+  the call, then deleted
+- if no password was resolved, `ansible-vault` runs in the document's directory and does
+  its own `ansible.cfg` / environment discovery
+- code actions are computed lazily (`codeAction/resolve`), so the subprocess only runs
+  when you actually pick an action — not on every code-action menu popup
 
 ## Installation
 
@@ -79,7 +94,9 @@ Release binaries are built by CI (`.github/workflows/release.yml`) on every `v*`
         "passwordFile": "~/.vault-pass.txt",
         // "password": "inline-password",   // avoid committing this
         // "encryptVaultId": "dev",         // emit $ANSIBLE_VAULT;1.2;AES256;dev headers
-        // "hoverPreview": false            // disable decrypted-value hover tooltips
+        // "hoverPreview": false,           // disable decrypted-value hover tooltips
+        // "ansibleVaultPath": "/usr/bin/ansible-vault" // use the real ansible-vault CLI
+        //                                              // instead of the built-in crypto
       },
       // Optional — explicit binary location:
       "binary": { "path": "/home/you/.cargo/bin/ansible-vault-lsp" }
